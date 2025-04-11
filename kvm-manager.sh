@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Полный скрипт для управления KVM с возможностью создания ВМ
+# Полный скрипт для управления KVM с расширенными возможностями
 # Поддерживает Debian/Ubuntu (deb) и CentOS/RHEL (rpm) системы
 
 set -e
@@ -21,8 +21,13 @@ VM_DEFAULT_OS_TYPE="linux"
 VM_DEFAULT_OS_VARIANT="ubuntu22.04"
 ISO_DIR="/var/lib/libvirt/isos"
 CEPH_POOL_NAME="libvirt-pool"
+LVM_VG="kvm-vg"
+ZFS_POOL="kvm-pool"
 VERSION_CHECK_URL="https://api.github.com/repos/libvirt/libvirt/tags"
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.0"
+API_PORT="8080"
+MONITORING_INTERVAL="60"
+OVIRT_ADMIN_PASSWORD=""
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -132,6 +137,13 @@ check_dependencies() {
     local pkg_manager=$(detect_pkg_manager)
     local required_pkgs=()
     local required_bins=("virsh" "qemu-img" "ssh-keygen" "ssh-keyscan" "virt-install")
+    
+    # Общие зависимости для всех функций
+    local common_pkgs=(
+        "jq"
+        "curl"
+        "libguestfs-tools"
+    )
 
     case $pkg_manager in
         "deb")
@@ -144,17 +156,24 @@ check_dependencies() {
                 "virtinst"
                 "arp-scan"
                 "genisoimage"
-                "libguestfs-tools"
-                "jq"
-                "curl"
+                "${common_pkgs[@]}"
+                # LVM поддержка
+                "lvm2"
+                "thin-provisioning-tools"
+                # ZFS поддержка
+                "zfsutils-linux"
+                # Мониторинг
+                "sysstat"
+                "prometheus-node-exporter"
             )
             ;;
         "rpm")
-            # Для RPM систем сначала добавляем EPEL и обновляем
             log "${YELLOW}Установка EPEL репозитория и обновление системы...${NC}"
             install_packages epel-release
             if command -v dnf &> /dev/null; then
                 dnf update -y
+                dnf install -y dnf-plugins-core
+                dnf config-manager --enable powertools 2>/dev/null || true
             else
                 yum update -y
             fi
@@ -168,9 +187,15 @@ check_dependencies() {
                 "virt-install"
                 "arp-scan"
                 "genisoimage"
-                "libguestfs-tools"
-                "jq"
-                "curl"
+                "${common_pkgs[@]}"
+                # LVM поддержка
+                "lvm2"
+                "device-mapper-persistent-data"
+                # ZFS поддержка (из ZFS репозитория)
+                "zfs"
+                # Мониторинг
+                "sysstat"
+                "prometheus-node_exporter"
             )
             ;;
         *)
@@ -179,7 +204,20 @@ check_dependencies() {
             ;;
     esac
 
-    # Проверка пакетов
+    # API зависимости (Python3)
+    if [[ "$ENABLE_API" == "true" ]]; then
+        required_pkgs+=(
+            "python3"
+            "python3-pip"
+            "python3-venv"
+        )
+        required_bins+=(
+            "python3"
+            "pip3"
+        )
+    fi
+
+    # Проверка и установка пакетов
     local missing_pkgs=()
     for pkg in "${required_pkgs[@]}"; do
         if { [ "$pkg_manager" = "deb" ] && ! dpkg -l | grep -q "^ii  $pkg"; } ||
@@ -191,6 +229,12 @@ check_dependencies() {
     if [ ${#missing_pkgs[@]} -ne 0 ]; then
         log "${YELLOW}Установка недостающих пакетов: ${missing_pkgs[*]}${NC}"
         install_packages "${missing_pkgs[@]}"
+    fi
+
+    # Проверка ZFS kernel module
+    if ! lsmod | grep -q zfs; then
+        log "${YELLOW}ZFS kernel module не загружен. Попытка загрузки...${NC}"
+        modprobe zfs || log "${RED}Не удалось загрузить ZFS модуль${NC}"
     fi
 
     # Проверка бинарных файлов
@@ -213,28 +257,262 @@ check_dependencies() {
     fi
 }
 
-# Установка Ceph
-install_ceph() {
+# Настройка LVM хранилища
+setup_lvm_storage() {
+    log "${YELLOW}Настройка LVM хранилища...${NC}"
+    
+    # Проверяем доступные VG
+    local vg_list=$(vgs --noheadings -o vg_name 2>/dev/null)
+    
+    if [ -z "$vg_list" ]; then
+        log "${RED}Не найдено ни одной группы томов (VG)${NC}"
+        log "Сначала создайте VG (например: vgcreate $LVM_VG /dev/sdX)"
+        return 1
+    fi
+    
+    echo -e "\n${YELLOW}Доступные группы томов:${NC}"
+    echo "$vg_list"
+    
+    echo -n "Введите имя группы томов для использования [$LVM_VG]: "
+    read selected_vg
+    selected_vg=${selected_vg:-$LVM_VG}
+    
+    if ! vgs "$selected_vg" &> /dev/null; then
+        log "${RED}Группа томов $selected_vg не существует${NC}"
+        return 1
+    fi
+    
+    # Создаем пул в libvirt
+    if ! virsh pool-info "$selected_vg" &> /dev/null; then
+        virsh pool-define-as --name "$selected_vg" --type logical --source-name "$selected_vg" --target /dev/"$selected_vg"
+        virsh pool-start "$selected_vg"
+        virsh pool-autostart "$selected_vg"
+    fi
+    
+    log "${GREEN}LVM хранилище настроено. Группа томов: $selected_vg${NC}"
+    log "Для создания тома: lvcreate -L 10G -n vm_disk $selected_vg"
+}
+
+# Настройка ZFS хранилища
+setup_zfs_storage() {
+    log "${YELLOW}Настройка ZFS хранилища...${NC}"
+    
+    # Проверяем доступные zpools
+    local zpool_list=$(zpool list -H -o name 2>/dev/null)
+    
+    if [ -z "$zpool_list" ]; then
+        log "${RED}Не найдено ни одного пула ZFS${NC}"
+        log "Сначала создайте zpool (например: zpool create $ZFS_POOL /dev/sdX)"
+        return 1
+    fi
+    
+    echo -e "\n${YELLOW}Доступные пулы ZFS:${NC}"
+    echo "$zpool_list"
+    
+    echo -n "Введите имя пула для использования [$ZFS_POOL]: "
+    read selected_pool
+    selected_pool=${selected_pool:-$ZFS_POOL}
+    
+    if ! zpool list "$selected_pool" &> /dev/null; then
+        log "${RED}Пул $selected_pool не существует${NC}"
+        return 1
+    fi
+    
+    # Создаем пул в libvirt
+    if ! virsh pool-info "$selected_pool" &> /dev/null; then
+        virsh pool-define-as --name "$selected_pool" --type zfs --source-name "$selected_pool"
+        virsh pool-start "$selected_pool"
+        virsh pool-autostart "$selected_pool"
+    fi
+    
+    log "${GREEN}ZFS хранилище настроено. Пул: $selected_pool${NC}"
+    log "Для создания тома: zfs create -V 10G $selected_pool/vm_disk"
+}
+
+# Запуск REST API
+start_api() {
+    log "${YELLOW}Запуск REST API сервера...${NC}"
+    
+    # Создаем виртуальное окружение Python
+    if [ ! -d "/opt/kvm-api/venv" ]; then
+        python3 -m venv /opt/kvm-api/venv
+        source /opt/kvm-api/venv/bin/activate
+        pip install flask flask-cors
+        deactivate
+    fi
+    
+    # Создаем файл API
+    cat > /opt/kvm-api/api.py <<EOF
+from flask import Flask, jsonify
+import subprocess
+import json
+
+app = Flask(__name__)
+
+@app.route('/api/vms', methods=['GET'])
+def list_vms():
+    try:
+        result = subprocess.run(['virsh', 'list', '--all'], capture_output=True, text=True)
+        return jsonify({"status": "success", "data": result.stdout})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/api/vms/<string:vm_name>', methods=['GET'])
+def vm_info(vm_name):
+    try:
+        result = subprocess.run(['virsh', 'dominfo', vm_name], capture_output=True, text=True)
+        return jsonify({"status": "success", "data": result.stdout})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=$API_PORT)
+EOF
+
+    # Создаем systemd сервис
+    cat > /etc/systemd/system/kvm-api.service <<EOF
+[Unit]
+Description=KVM Manager API
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/kvm-api
+ExecStart=/opt/kvm-api/venv/bin/python /opt/kvm-api/api.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now kvm-api
+    
+    log "${GREEN}REST API запущен на порту $API_PORT${NC}"
+    log "Пример запроса: curl http://localhost:$API_PORT/api/vms"
+}
+
+# Мониторинг ресурсов
+start_monitoring() {
+    log "${YELLOW}Запуск мониторинга ресурсов...${NC}"
+    
+    # Создаем директорию для скриптов мониторинга
+    mkdir -p /opt/kvm-monitoring
+    
+    # Создаем скрипт сбора метрик
+    cat > /opt/kvm-monitoring/collect_metrics.sh <<EOF
+#!/bin/bash
+
+while true; do
+    # Собираем метрики
+    TIMESTAMP=\$(date +%s)
+    VM_LIST=\$(virsh list --name | grep -v "^$")
+    
+    for VM in \$VM_LIST; do
+        CPU_USAGE=\$(virsh dominfo \$VM | grep "CPU usage" | awk '{print \$3\$4}')
+        MEM_USAGE=\$(virsh dommemstat \$VM | grep "rss" | awk '{print \$2}')
+        
+        echo "\$TIMESTAMP,\$VM,CPU,\$CPU_USAGE" >> /var/log/kvm_metrics.csv
+        echo "\$TIMESTAMP,\$VM,MEM,\$MEM_USAGE" >> /var/log/kvm_metrics.csv
+    done
+    
+    sleep $MONITORING_INTERVAL
+done
+EOF
+
+    chmod +x /opt/kvm-monitoring/collect_metrics.sh
+    
+    # Создаем systemd сервис
+    cat > /etc/systemd/system/kvm-monitoring.service <<EOF
+[Unit]
+Description=KVM Monitoring Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/opt/kvm-monitoring/collect_metrics.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now kvm-monitoring
+    
+    log "${GREEN}Мониторинг запущен. Данные сохраняются в /var/log/kvm_metrics.csv${NC}"
+}
+
+# Установка oVirt Engine (упрощенная версия)
+install_ovirt() {
+    log "${YELLOW}Установка oVirt Engine...${NC}"
+    
     local pkg_manager=$(detect_pkg_manager)
     
-    log "${YELLOW}Установка Ceph...${NC}"
-    
     case $pkg_manager in
-        "deb")
-            # Для Ubuntu/Debian
-            if ! grep -q "ceph" /etc/apt/sources.list.d/ceph.list 2>/dev/null; then
-                wget -q -O- 'https://download.ceph.com/keys/release.asc' | apt-key add -
-                echo "deb https://download.ceph.com/debian-luminous/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/ceph.list
-                apt-get update
-            fi
-            install_packages ceph ceph-common radosgw
-            ;;
         "rpm")
-            # Для CentOS/RHEL
-            if [ ! -f /etc/yum.repos.d/ceph.repo ]; then
-                rpm -Uvh https://download.ceph.com/rpm-luminous/el7/noarch/ceph-release-1-1.el7.noarch.rpm
+            # Проверяем, не установлен ли уже oVirt
+            if rpm -q ovirt-engine &>/dev/null; then
+                log "${YELLOW}oVirt Engine уже установлен${NC}"
+                return 0
             fi
-            install_packages ceph ceph-common
+
+            # Упрощённая установка для CentOS/RHEL 8+
+            if grep -q "CentOS Linux 8" /etc/centos-release || grep -q "Red Hat Enterprise Linux 8" /etc/redhat-release; then
+                log "${GREEN}Обнаружена CentOS/RHEL 8+, используем упрощённую установку${NC}"
+                
+                # Устанавливаем необходимые репозитории
+                dnf install -y centos-release-ovirt45
+                dnf install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
+                
+                # Отключаем модуль postgresql для правильной установки
+                dnf module -y disable postgresql
+                
+                # Устанавливаем оVirt Engine с автоматической настройкой
+                dnf install -y ovirt-engine
+                
+                # Генерируем случайный пароль, если не задан
+                if [ -z "$OVIRT_ADMIN_PASSWORD" ]; then
+                    OVIRT_ADMIN_PASSWORD=$(openssl rand -base64 12)
+                    log "${YELLOW}Сгенерирован случайный пароль admin: $OVIRT_ADMIN_PASSWORD${NC}"
+                fi
+                
+                # Автоматическая настройка с минимальными параметрами
+                engine-setup --accept-defaults \
+                    --admin-password="$OVIRT_ADMIN_PASSWORD" \
+                    --config-append=/etc/ovirt-engine-setup.conf.d/10-setup-answers.conf
+                
+                # Сохраняем пароль в файл
+                echo "Admin password: $OVIRT_ADMIN_PASSWORD" > /etc/ovirt-engine/credentials.txt
+                chmod 600 /etc/ovirt-engine/credentials.txt
+                
+                # Включаем и запускаем сервисы
+                systemctl enable --now ovirt-engine
+                systemctl enable --now httpd
+                
+                log "${GREEN}oVirt Engine успешно установлен!${NC}"
+                log "Доступ через веб-интерфейс: https://$(hostname -f)/ovirt-engine"
+                log "Логин: admin"
+                log "Пароль: $OVIRT_ADMIN_PASSWORD (также сохранен в /etc/ovirt-engine/credentials.txt)"
+                return 0
+            fi
+
+            # Стандартная установка для других версий
+            if [ ! -f /etc/yum.repos.d/ovirt.repo ]; then
+                dnf install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
+                dnf install -y ovirt-engine
+                
+                log "${YELLOW}Запуск интерактивной настройки oVirt Engine...${NC}"
+                log "Для автоматической установки примите значения по умолчанию (нажимайте Enter)"
+                engine-setup
+            else
+                log "${YELLOW}oVirt Engine уже установлен${NC}"
+            fi
+            ;;
+        "deb")
+            log "${RED}oVirt Engine не поддерживается на DEB-системах${NC}"
+            log "Используйте CentOS/RHEL 8+ для установки oVirt"
+            return 1
             ;;
         *)
             log "${RED}Неизвестный пакетный менеджер${NC}"
@@ -242,461 +520,23 @@ install_ceph() {
             ;;
     esac
     
-    log "${GREEN}Ceph установлен${NC}"
+    log "${GREEN}oVirt Engine установлен. Доступен через web-интерфейс: https://$(hostname -I | awk '{print $1}'):443${NC}"
+    log "Для доступа используйте:"
+    log "Логин: admin"
+    log "Пароль: указанный при установке (хранится в /etc/ovirt-engine/credentials.txt)"
 }
 
-# Настройка Ceph кластера
-setup_ceph_cluster() {
-    local node_ip=$1
-    local ceph_nodes=("${@:2}")
-    
-    log "${YELLOW}Настройка Ceph кластера...${NC}"
-    
-    # Проверяем установлен ли Ceph
-    if ! command -v ceph &> /dev/null; then
-        install_ceph
-    fi
-    
-    # Создаем конфигурационный файл
-    mkdir -p /etc/ceph
-    cat > $CEPH_CONF <<EOF
-[global]
-fsid = $(uuidgen)
-mon initial members = $(hostname -s)
-mon host = $node_ip
-public network = ${node_ip%.*}.0/24
-auth cluster required = cephx
-auth service required = cephx
-auth client required = cephx
-osd journal size = 1024
-osd pool default size = 3
-osd pool default min size = 1
-osd pool default pg num = 256
-osd pool default pgp num = 256
-osd crush chooseleaf type = 1
-EOF
-    
-    # Создаем ключи
-    ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
-    ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
-    ceph-authtool --create-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring --gen-key -n client.bootstrap-osd --cap mon 'profile bootstrap-osd' --cap mgr 'allow r'
-    ceph-authtool /tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
-    ceph-authtool /tmp/ceph.mon.keyring --import-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring
-    
-    # Настраиваем monmap
-    monmaptool --create --add $(hostname -s) $node_ip --fsid $(grep fsid $CEPH_CONF | cut -d' ' -f3) /tmp/monmap
-    
-    # Создаем директории
-    mkdir -p /var/lib/ceph/mon/ceph-$(hostname -s)
-    mkdir -p /var/lib/ceph/osd
-    
-    # Запускаем монитор
-    ceph-mon --mkfs -i $(hostname -s) --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
-    systemctl start ceph-mon@$(hostname -s)
-    systemctl enable ceph-mon@$(hostname -s)
-    
-    # Добавляем OSD
-    for disk in $(lsblk -dpn -o NAME | grep -v "/dev/[sv]da"); do
-        ceph-volume lvm create --data $disk
-    done
-    
-    # Если есть другие узлы, добавляем их в кластер
-    if [ ${#ceph_nodes[@]} -gt 0 ]; then
-        for node in "${ceph_nodes[@]}"; do
-            ssh $node "$(declare -f install_ceph); install_ceph"
-            scp $CEPH_CONF $node:$CEPH_CONF
-            scp /etc/ceph/ceph.client.admin.keyring $node:/etc/ceph/
-            
-            ssh $node "ceph-mon --mkfs -i $(hostname -s) --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring"
-            ssh $node "systemctl start ceph-mon@$(hostname -s)"
-            ssh $node "systemctl enable ceph-mon@$(hostname -s)"
-            
-            for disk in $(ssh $node "lsblk -dpn -o NAME | grep -v '/dev/[sv]da'"); do
-                ssh $node "ceph-volume lvm create --data $disk"
-            done
-        done
-    fi
-    
-    # Создаем пул для libvirt
-    ceph osd pool create $CEPH_POOL_NAME 128 128
-    ceph osd pool application enable $CEPH_POOL_NAME rbd
-    
-    # Настраиваем права
-    ceph auth get-or-create client.libvirt mon 'allow r' osd "allow class-read object_prefix rbd_children, allow rwx pool=$CEPH_POOL_NAME"
-    
-    log "${GREEN}Ceph кластер настроен${NC}"
-    log "Для проверки выполните: ceph -s"
-}
-
-# Настройка интеграции Ceph с libvirt
-setup_ceph_libvirt() {
-    log "${YELLOW}Настройка интеграции Ceph с libvirt...${NC}"
-    
-    # Получаем ключ для libvirt
-    local libvirt_key=$(ceph auth get-key client.libvirt)
-    
-    # Создаем секрет для libvirt
-    cat > /tmp/secret.xml <<EOF
-<secret ephemeral='no' private='no'>
-  <usage type='ceph'>
-    <name>client.libvirt secret</name>
-  </usage>
-</secret>
-EOF
-    
-    virsh secret-define --file /tmp/secret.xml
-    virsh secret-set-value --secret $(virsh secret-list | grep client.libvirt | awk '{print $1}') --base64 $libvirt_key
-    
-    # Создаем пул хранения
-    cat > /tmp/ceph-pool.xml <<EOF
-<pool type='rbd'>
-  <name>$CEPH_POOL_NAME</name>
-  <source>
-    <name>$CEPH_POOL_NAME</name>
-    <host name='$(hostname -s)' port='6789'/>
-    <auth type='ceph' username='libvirt'>
-      <secret uuid='$(virsh secret-list | grep client.libvirt | awk '{print $1}')'/>
-    </auth>
-  </source>
-</pool>
-EOF
-    
-    virsh pool-define /tmp/ceph-pool.xml
-    virsh pool-start $CEPH_POOL_NAME
-    virsh pool-autostart $CEPH_POOL_NAME
-    
-    log "${GREEN}Интеграция Ceph с libvirt настроена${NC}"
-    log "Теперь можно создавать диски ВМ в Ceph:"
-    log "virsh vol-create-as $CEPH_POOL_NAME vm-disk.qcow2 20G --format raw"
-}
-
-# Создание виртуальной машины
-create_vm() {
-    local vm_name=$1
-    local vm_ram=$2
-    local vm_cpus=$3
-    local disk_size=$4
-    local os_variant=$5
-    local iso_path=$6
-    local network=$7
-
-    log "${YELLOW}Создание виртуальной машины ${vm_name}...${NC}"
-
-    # Проверка существования ВМ
-    if virsh list --all | grep -q " ${vm_name} "; then
-        log "${RED}Виртуальная машина с именем ${vm_name} уже существует${NC}"
-        return 1
-    fi
-
-    # Проверка ISO образа
-    if [ ! -f "$iso_path" ]; then
-        log "${RED}ISO образ не найден: ${iso_path}${NC}"
-        return 1
-    fi
-
-    # Создание директории для дисков
-    local vm_dir="/var/lib/libvirt/images/${vm_name}"
-    mkdir -p "$vm_dir"
-
-    # Создание диска
-    local disk_path="${vm_dir}/${vm_name}.qcow2"
-    qemu-img create -f qcow2 "$disk_path" "$disk_size"
-
-    # Создание ВМ
-    virt-install \
-        --name "$vm_name" \
-        --ram "$vm_ram" \
-        --vcpus "$vm_cpus" \
-        --disk path="$disk_path",size="$disk_size",format=qcow2 \
-        --os-type "$VM_DEFAULT_OS_TYPE" \
-        --os-variant "$os_variant" \
-        --network "$network" \
-        --graphics spice \
-        --cdrom "$iso_path" \
-        --noautoconsole
-
-    if [ $? -eq 0 ]; then
-        log "${GREEN}Виртуальная машина ${vm_name} успешно создана${NC}"
-        log "Подключиться через virt-viewer: virt-viewer ${vm_name}"
-        log "Или через консоль: virsh console ${vm_name}"
-    else
-        log "${RED}Ошибка при создании виртуальной машины ${vm_name}${NC}"
-        return 1
-    fi
-}
-
-# Интерфейс для создания ВМ
-create_vm_ui() {
-    echo -e "\n${YELLOW}Создание новой виртуальной машины${NC}"
-    
-    # Запрос параметров
-    echo -n "Введите имя виртуальной машины: "
-    read vm_name
-    
-    echo -n "Количество RAM (MB) [${VM_DEFAULT_RAM}]: "
-    read vm_ram
-    vm_ram=${vm_ram:-$VM_DEFAULT_RAM}
-    
-    echo -n "Количество CPU ядер [${VM_DEFAULT_CPUS}]: "
-    read vm_cpus
-    vm_cpus=${vm_cpus:-$VM_DEFAULT_CPUS}
-    
-    echo -n "Размер диска (например, 20G) [${VM_DEFAULT_DISK_SIZE}]: "
-    read disk_size
-    disk_size=${disk_size:-$VM_DEFAULT_DISK_SIZE}
-    
-    echo -n "Тип ОС (например, ubuntu22.04) [${VM_DEFAULT_OS_VARIANT}]: "
-    read os_variant
-    os_variant=${os_variant:-$VM_DEFAULT_OS_VARIANT}
-    
-    echo -n "Путь к ISO образу (например, ${ISO_DIR}/ubuntu.iso): "
-    read iso_path
-    
-    echo -n "Сеть (по умолчанию: default): "
-    read network
-    network=${network:-"default"}
-    
-    # Проверка и создание ISO директории
-    mkdir -p "$ISO_DIR"
-    
-    # Создание ВМ
-    create_vm "$vm_name" "$vm_ram" "$vm_cpus" "$disk_size" "$os_variant" "$iso_path" "$network"
-}
-
-# Создание бекапа виртуальной машины
-backup_vm() {
-    local vm_name=$1
-    local snapshot_name="backup_snapshot_$(date +%Y%m%d%H%M%S)"
-    local backup_path="$BACKUP_DIR/$vm_name/$(date +%Y%m%d_%H%M%S)"
-    
-    log "${YELLOW}Начинаем бекап виртуальной машины $vm_name${NC}"
-    
-    # Проверяем существование VM
-    if ! virsh dominfo "$vm_name" &> /dev/null; then
-        log "${RED}Ошибка: Виртуальная машина $vm_name не найдена${NC}"
-        return 1
-    fi
-    
-    # Проверяем состояние VM
-    local vm_state=$(virsh domstate "$vm_name")
-    
-    # Если VM запущена, создаем снепшот
-    if [ "$vm_state" == "running" ]; then
-        log "ВМ запущена, создаем снепшот..."
-        virsh snapshot-create-as --domain "$vm_name" --name "$snapshot_name" --atomic --quiesce
-        if [ $? -ne 0 ]; then
-            log "${RED}Ошибка при создании снепшота${NC}"
-            return 1
-        fi
-    fi
-    
-    # Создаем директорию для бекапа
-    mkdir -p "$backup_path"
-    
-    # Получаем список дисков VM
-    local disks=$(virsh domblklist "$vm_name" | awk 'NR>2 && $2 {print $2}')
-    
-    # Копируем конфигурацию VM
-    log "Копируем XML конфигурацию..."
-    virsh dumpxml "$vm_name" > "$backup_path/$vm_name.xml"
-    
-    # Копируем диски
-    for disk in $disks; do
-        local disk_name=$(basename "$disk")
-        log "Копируем диск $disk_name..."
-        qemu-img convert -O qcow2 "$disk" "$backup_path/$disk_name.qcow2"
-    done
-    
-    # Если был создан снепшот, удаляем его
-    if [ "$vm_state" == "running" ]; then
-        log "Удаляем временный снепшот..."
-        virsh snapshot-delete "$vm_name" "$snapshot_name" &> /dev/null
-    fi
-    
-    log "${GREEN}Бекап виртуальной машины $vm_name успешно создан в $backup_path${NC}"
-}
-
-# Интерфейс для создания бекапа
-backup_vm_ui() {
-    echo -e "\n${YELLOW}Создание бекапа виртуальной машины${NC}"
-    echo -n "Введите имя виртуальной машины для бекапа: "
-    read vm_name
-    backup_vm "$vm_name"
-}
-
-# Восстановление VM из бекапа
-restore_vm() {
-    local vm_name=$1
-    local backup_path=$2
-    
-    log "${YELLOW}Начинаем восстановление $vm_name из $backup_path${NC}"
-    
-    # Проверяем существование бекапа
-    if [ ! -d "$backup_path" ]; then
-        log "${RED}Ошибка: Директория бекапа $backup_path не найдена${NC}"
-        return 1
-    fi
-    
-    # Проверяем XML файл
-    if [ ! -f "$backup_path/$vm_name.xml" ]; then
-        log "${RED}Ошибка: XML конфигурация не найдена${NC}"
-        return 1
-    fi
-    
-    # Удаляем VM если она уже существует
-    if virsh dominfo "$vm_name" &> /dev/null; then
-        log "ВМ уже существует, удаляем..."
-        virsh destroy "$vm_name" &> /dev/null || true
-        virsh undefine "$vm_name" --nvram
-    fi
-    
-    # Регистрируем VM
-    log "Восстанавливаем XML конфигурацию..."
-    virsh define "$backup_path/$vm_name.xml"
-    
-    # Восстанавливаем диски
-    local disks=$(virsh domblklist "$vm_name" | awk 'NR>2 && $2 {print $2}')
-    
-    for disk in $disks; do
-        local disk_name=$(basename "$disk")
-        if [ -f "$backup_path/$disk_name.qcow2" ]; then
-            log "Восстанавливаем диск $disk_name..."
-            qemu-img convert -O qcow2 "$backup_path/$disk_name.qcow2" "$disk"
-        else
-            log "${YELLOW}Предупреждение: Файл диска $disk_name.qcow2 не найден${NC}"
-        fi
-    done
-    
-    log "${GREEN}Виртуальная машина $vm_name успешно восстановлена${NC}"
-}
-
-# Интерфейс для восстановления
-restore_vm_ui() {
-    echo -e "\n${YELLOW}Восстановление виртуальной машины из бекапа${NC}"
-    echo -n "Введите имя виртуальной машины для восстановления: "
-    read vm_name
-    echo -n "Введите путь к бекапу: "
-    read backup_path
-    restore_vm "$vm_name" "$backup_path"
-}
-
-# Поиск KVM хостов в локальной сети
-discover_kvm_hosts() {
-    log "${YELLOW}Поиск KVM хостов в локальной сети...${NC}"
-    
-    # Получаем локальную подсеть
-    local subnet=$(ip route | awk '/src/ {print $1}' | head -1)
-    
-    if [ -z "$subnet" ]; then
-        log "${RED}Не удалось определить локальную подсеть${NC}"
-        return 1
-    fi
-    
-    log "Сканируем подсеть $subnet..."
-    
-    # Используем arp-scan для поиска хостов
-    local hosts=$(arp-scan --localnet --quiet --ignoredups | awk 'NR>2 {print $1}' | sort -u)
-    
-    if [ -z "$hosts" ]; then
-        log "${YELLOW}Хосты не найдены${NC}"
-        return 0
-    fi
-    
-    log "Найдены хосты:"
-    for host in $hosts; do
-        # Проверяем, есть ли libvirt на хосте
-        if ssh -o ConnectTimeout=5 -i $SSH_KEY $NODE_USER@$host "which virsh &> /dev/null"; then
-            echo -e "${GREEN}$host - KVM хост${NC}"
-        else
-            echo "$host"
-        fi
-    done
-}
-
-# Настройка SSH ключей для кластера
-setup_ssh_keys() {
-    log "${YELLOW}Настройка SSH ключей для кластера...${NC}"
-    
-    if [ ! -f "$SSH_KEY" ]; then
-        log "Генерация SSH ключа..."
-        ssh-keygen -t rsa -b 4096 -f "$SSH_KEY" -N "" -q
-    fi
-    
-    # Добавляем ключ в authorized_keys
-    cat "${SSH_KEY}.pub" >> ~/.ssh/authorized_keys
-    chmod 600 ~/.ssh/authorized_keys
-    
-    log "${GREEN}SSH ключи настроены${NC}"
-}
-
-# Добавление узла в кластер
-add_node_to_cluster() {
-    local node_ip=$1
-    
-    log "${YELLOW}Добавление узла $node_ip в кластер...${NC}"
-    
-    # Проверяем доступность узла
-    if ! ping -c 1 -W 2 "$node_ip" &> /dev/null; then
-        log "${RED}Узел $node_ip недоступен${NC}"
-        return 1
-    fi
-    
-    # Копируем SSH ключ
-    log "Копируем SSH ключ на узел $node_ip..."
-    ssh-copy-id -i "$SSH_KEY" "$NODE_USER@$node_ip"
-    
-    # Проверяем наличие libvirt на узле
-    if ! ssh -i "$SSH_KEY" "$NODE_USER@$node_ip" "which virsh &> /dev/null"; then
-        log "${RED}Libvirt не установлен на узле $node_ip${NC}"
-        return 1
-    fi
-    
-    # Добавляем узел в список известных хостов
-    ssh-keyscan "$node_ip" >> ~/.ssh/known_hosts
-    
-    log "${GREEN}Узел $node_ip успешно добавлен в кластер${NC}"
-}
-
-# Создание кластера KVM хостов
-create_cluster() {
-    local nodes=("$@")
-    
-    if [ ${#nodes[@]} -eq 0 ]; then
-        log "${RED}Не указаны узлы для кластера${NC}"
-        return 1
-    fi
-    
-    log "${YELLOW}Создание кластера KVM из ${#nodes[@]} узлов...${NC}"
-    
-    # Настраиваем SSH ключи
-    setup_ssh_keys
-    
-    # Добавляем каждый узел в кластер
-    for node in "${nodes[@]}"; do
-        add_node_to_cluster "$node"
-    done
-    
-    log "${GREEN}Кластер KVM успешно создан${NC}"
-    log "Для управления узлами используйте: virsh -c qemu+ssh://user@node/system"
-}
-
-# Интерфейс для создания кластера
-create_cluster_ui() {
-    echo -e "\n${YELLOW}Создание кластера KVM${NC}"
-    echo -n "Введите IP адреса узлов через пробел: "
-    read -a nodes
-    create_cluster "${nodes[@]}"
-}
-
-# Меню настройки хранилища
+# Обновленное меню хранилища
 storage_menu() {
     while true; do
-        echo -e "\n${YELLOW}Настройка общего хранилища${NC}"
+        echo -e "\n${YELLOW}Настройка хранилища${NC}"
         echo "1) Настроить NFS сервер"
         echo "2) Настроить NFS клиент"
         echo "3) Установить и настроить Ceph"
         echo "4) Настроить интеграцию Ceph с libvirt"
-        echo "5) Вернуться в главное меню"
+        echo "5) Настроить LVM хранилище"
+        echo "6) Настроить ZFS хранилище"
+        echo "7) Вернуться в главное меню"
         echo -n "Выберите опцию: "
         
         read option
@@ -715,194 +555,12 @@ storage_menu() {
                 setup_ceph_cluster "$node_ip" "${ceph_nodes[@]}"
                 ;;
             4) setup_ceph_libvirt ;;
-            5) return ;;
+            5) setup_lvm_storage ;;
+            6) setup_zfs_storage ;;
+            7) return ;;
             *) log "${RED}Неверный выбор${NC}" ;;
         esac
     done
-}
-
-# Настройка NFS сервера
-setup_nfs_server() {
-    log "${YELLOW}Настройка NFS сервера...${NC}"
-    
-    local pkg_manager=$(detect_pkg_manager)
-    
-    case $pkg_manager in
-        "deb")
-            install_packages nfs-kernel-server
-            ;;
-        "rpm")
-            install_packages nfs-utils
-            systemctl enable --now nfs-server
-            ;;
-        *)
-            log "${RED}Неизвестный пакетный менеджер${NC}"
-            return 1
-            ;;
-    esac
-    
-    # Общая часть настройки
-    mkdir -p "$SHARED_STORAGE"
-    chown nobody:nogroup "$SHARED_STORAGE"
-    chmod 777 "$SHARED_STORAGE"
-    
-    echo "$SHARED_STORAGE *(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
-    
-    if [ "$pkg_manager" = "deb" ]; then
-        systemctl restart nfs-kernel-server
-    else
-        exportfs -a
-        systemctl restart nfs-server
-    fi
-    
-    NFS_SERVER=$(hostname -I | awk '{print $1}')
-    log "${GREEN}NFS сервер настроен. Экспортируется: $SHARED_STORAGE${NC}"
-    log "Используйте этот IP для подключения клиентов: $NFS_SERVER"
-}
-
-# Настройка NFS клиента
-setup_nfs_client() {
-    local nfs_server=$1
-    local pkg_manager=$(detect_pkg_manager)
-    
-    log "${YELLOW}Настройка NFS клиента для подключения к $nfs_server...${NC}"
-    
-    case $pkg_manager in
-        "deb")
-            install_packages nfs-common
-            ;;
-        "rpm")
-            install_packages nfs-utils
-            ;;
-        *)
-            log "${RED}Неизвестный пакетный менеджер${NC}"
-            return 1
-            ;;
-    esac
-    
-    mkdir -p "$SHARED_STORAGE"
-    
-    if ! grep -qs "$SHARED_STORAGE" /proc/mounts; then
-        mount "$nfs_server:$SHARED_STORAGE" "$SHARED_STORAGE"
-        echo "$nfs_server:$SHARED_STORAGE $SHARED_STORAGE nfs auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" >> /etc/fstab
-    fi
-    
-    if ! virsh pool-list --all | grep -q shared_storage; then
-        virsh pool-define-as --name shared_storage --type dir --target "$SHARED_STORAGE"
-        virsh pool-build shared_storage
-        virsh pool-start shared_storage
-        virsh pool-autostart shared_storage
-    fi
-    
-    log "${GREEN}NFS клиент настроен. Общее хранилище доступно в $SHARED_STORAGE${NC}"
-}
-
-# Настройка live миграции
-setup_live_migration() {
-    log "${YELLOW}Настройка live migration...${NC}"
-    
-    local pkg_manager=$(detect_pkg_manager)
-    
-    # Настройка libvirt
-    sed -i '/^#listen_tls = /c\listen_tls = 0' /etc/libvirt/libvirtd.conf
-    sed -i '/^#listen_tcp = /c\listen_tcp = 1' /etc/libvirt/libvirtd.conf
-    sed -i '/^#auth_tcp = /c\auth_tcp = "none"' /etc/libvirt/libvirtd.conf
-    
-    if [ "$pkg_manager" = "deb" ]; then
-        sed -i '/^LIBVIRTD_ARGS=/c\LIBVIRTD_ARGS="--listen"' /etc/default/libvirtd
-    else
-        echo 'LIBVIRTD_ARGS="--listen"' > /etc/sysconfig/libvirtd
-    fi
-    
-    # Настройка QEMU
-    sed -i '/^#user = /c\user = "root"' /etc/libvirt/qemu.conf
-    sed -i '/^#group = /c\group = "root"' /etc/libvirt/qemu.conf
-    
-    # Перезапуск служб
-    systemctl restart libvirtd
-    
-    # Открытие портов в firewall (для RPM-систем)
-    if [ "$pkg_manager" = "rpm" ]; then
-        if systemctl is-active --quiet firewalld; then
-            firewall-cmd --add-port=16509/tcp --permanent
-            firewall-cmd --add-port=16514/tcp --permanent
-            firewall-cmd --reload
-        fi
-    fi
-    
-    log "${GREEN}Настройка live migration завершена${NC}"
-    log "Для миграции используйте: virsh migrate --live --verbose vm_name qemu+ssh://target_host/system"
-}
-
-# Установка Proxmox VE
-install_proxmox() {
-    log "${YELLOW}Установка Proxmox VE...${NC}"
-    
-    local pkg_manager=$(detect_pkg_manager)
-    
-    case $pkg_manager in
-        "deb")
-            # Проверяем, является ли система Debian
-            if ! grep -q "Debian" /etc/os-release; then
-                log "${RED}Proxmox VE официально поддерживается только на Debian${NC}"
-                return 1
-            fi
-
-            # Добавляем репозиторий Proxmox
-            echo "deb http://download.proxmox.com/debian/pve $(grep "VERSION_CODENAME=" /etc/os-release | cut -d= -f2) pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
-
-            # Добавляем GPG ключ
-            wget https://enterprise.proxmox.com/debian/proxmox-release-$(grep "VERSION_CODENAME=" /etc/os-release | cut -d= -f2).gpg -O /etc/apt/trusted.gpg.d/proxmox-release.gpg
-            
-            # Обновляем и устанавливаем
-            apt-get update
-            apt-get install -y proxmox-ve postfix open-iscsi
-            
-            # Настройка postfix
-            debconf-set-selections <<< "postfix postfix/mailname string $(hostname -f)"
-            debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Local only'"
-            ;;
-        "rpm")
-            log "${RED}Proxmox VE не поддерживается на RPM-системах${NC}"
-            return 1
-            ;;
-        *)
-            log "${RED}Неизвестный пакетный менеджер${NC}"
-            return 1
-            ;;
-    esac
-    
-    log "${GREEN}Proxmox VE установлен. Доступен через web-интерфейс: https://$(hostname -I | awk '{print $1}'):8006${NC}"
-    log "Рекомендуется перезагрузить систему после установки"
-}
-
-# Установка oVirt Engine
-install_ovirt() {
-    log "${YELLOW}Установка oVirt Engine...${NC}"
-    
-    local pkg_manager=$(detect_pkg_manager)
-    
-    case $pkg_manager in
-        "rpm")
-            if [ ! -f /etc/yum.repos.d/ovirt.repo ]; then
-                yum install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
-                yum install -y ovirt-engine
-                engine-setup
-            else
-                log "${YELLOW}oVirt Engine уже установлен${NC}"
-            fi
-            ;;
-        "deb")
-            log "${RED}oVirt Engine не поддерживается на DEB-системах${NC}"
-            return 1
-            ;;
-        *)
-            log "${RED}Неизвестный пакетный менеджер${NC}"
-            return 1
-            ;;
-    esac
-    
-    log "${GREEN}oVirt Engine установлен. Доступен через web-интерфейс: https://$(hostname -I | awk '{print $1}'):443${NC}"
 }
 
 # Обновленное главное меню
@@ -913,36 +571,14 @@ show_menu() {
     echo "3) Восстановить виртуальную машину из бекапа"
     echo "4) Найти KVM хосты в сети"
     echo "5) Создать кластер KVM"
-    echo "6) Настроить общее хранилище"
+    echo "6) Настроить хранилище"
     echo "7) Настроить live миграцию ВМ"
-    echo "8) Установить Proxmox VE"
-    echo "9) Установить oVirt Engine"
-    echo "10) Проверить версии компонентов"
-    echo "11) Выход"
+    echo "8) Запустить REST API"
+    echo "9) Запустить мониторинг ресурсов"
+    echo "10) Установить oVirt Engine"
+    echo "11) Проверить версии компонентов"
+    echo "12) Выход"
     echo -n "Выберите опцию: "
-}
-
-# Инициализация
-init() {
-    # Проверка прав
-    if [ "$(id -u)" -ne 0 ]; then
-        log "${RED}Скрипт требует root-прав${NC}"
-        exit 1
-    fi
-    
-    # Создание директорий
-    mkdir -p "$BACKUP_DIR" "$ISO_DIR" "$SHARED_STORAGE"
-    touch "$LOG_FILE"
-    
-    # Проверка зависимостей
-    check_dependencies
-    
-    # Проверка работы libvirt
-    if ! systemctl is-active --quiet libvirtd; then
-        log "${YELLOW}Запуск службы libvirtd...${NC}"
-        systemctl start libvirtd
-        systemctl enable libvirtd
-    fi
 }
 
 # Главная функция
@@ -961,10 +597,11 @@ main() {
             5) create_cluster_ui ;;
             6) storage_menu ;;
             7) setup_live_migration ;;
-            8) install_proxmox ;;
-            9) install_ovirt ;;
-            10) check_versions ;;
-            11) exit 0 ;;
+            8) start_api ;;
+            9) start_monitoring ;;
+            10) install_ovirt ;;
+            11) check_versions ;;
+            12) exit 0 ;;
             *) log "${RED}Неверный выбор${NC}" ;;
         esac
     done
