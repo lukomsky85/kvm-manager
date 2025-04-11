@@ -22,7 +22,7 @@ VM_DEFAULT_OS_VARIANT="ubuntu22.04"
 ISO_DIR="/var/lib/libvirt/isos"
 CEPH_POOL_NAME="libvirt-pool"
 VERSION_CHECK_URL="https://api.github.com/repos/libvirt/libvirt/tags"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -150,6 +150,15 @@ check_dependencies() {
             )
             ;;
         "rpm")
+            # Для RPM систем сначала добавляем EPEL и обновляем
+            log "${YELLOW}Установка EPEL репозитория и обновление системы...${NC}"
+            install_packages epel-release
+            if command -v dnf &> /dev/null; then
+                dnf update -y
+            else
+                yum update -y
+            fi
+
             required_pkgs=(
                 "libvirt-client"
                 "qemu-img"
