@@ -76,7 +76,7 @@ check_versions() {
 
 # Проверка обновлений скрипта
 check_script_update() {
-    local remote_version=$(curl -s https://raw.githubusercontent.com/yourusername/kvm-manager/main/kvm-manager.sh | grep "SCRIPT_VERSION=" | cut -d'"' -f2)
+    local remote_version=$(curl -s https://raw.githubusercontent.com/lukomsky85/kvm-manager/main/kvm-manager.sh | grep "SCRIPT_VERSION=" | cut -d'"' -f2)
     
     if [ -z "$remote_version" ]; then
         log "${YELLOW}Не удалось проверить обновления скрипта${NC}"
@@ -86,7 +86,7 @@ check_script_update() {
     if [ "$remote_version" != "$SCRIPT_VERSION" ]; then
         log "${YELLOW}Доступна новая версия скрипта ($remote_version)!${NC}"
         log "Обновить можно командой:"
-        log "curl -s https://raw.githubusercontent.com/yourusername/kvm-manager/main/kvm-manager.sh > /tmp/kvm-manager.sh && sudo mv /tmp/kvm-manager.sh /usr/local/bin/kvm-manager && sudo chmod +x /usr/local/bin/kvm-manager"
+        log "curl -s https://raw.githubusercontent.com/lukomsky85/kvm-manager/main/kvm-manager.sh > /tmp/kvm-manager.sh && sudo mv /tmp/kvm-manager.sh /usr/local/bin/kvm-manager && sudo chmod +x /usr/local/bin/kvm-manager"
     else
         log "${GREEN}Скрипт актуален (версия $SCRIPT_VERSION)${NC}"
     fi
