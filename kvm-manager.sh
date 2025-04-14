@@ -545,83 +545,114 @@ setup_zfs_storage() {
 
 # Создание виртуальной машины
 create_vm() {
-    local vm_name=$1
-    local vm_ram=$2
-    local vm_cpus=$3
-    local vm_disk_size=$4
-    local vm_iso=$5
-    local vm_network=$6
-    local vm_storage=$7
+    local vm_name=$1 vm_ram=$2 vm_cpus=$3 vm_disk_size=$4 vm_iso=$5 vm_network=$6 vm_storage=$7
 
-    log "${YELLOW}Создание виртуальной машины $vm_name...${NC}"
+    # 1. Проверка и установка зависимостей
+install_kvm_packages() {
+    local pkg_manager=$(detect_pkg_manager)
+    
+    case $pkg_manager in
+        "deb")
+            # Для Debian/Ubuntu
+            install_packages qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients virtinst bridge-utils
+            ;;
+        "rpm")
+            # Для CentOS/RHEL
+            if dnf list installed qemu-kvm &>/dev/null; then
+                log "${YELLOW}QEMU/KVM уже установлен${NC}"
+            else
+                log "${YELLOW}Установка QEMU/KVM для RHEL/CentOS...${NC}"
+                
+                # Основные пакеты имеют другие названия в RHEL/CentOS
+                install_packages qemu-kvm qemu-img libvirt virt-install virt-viewer
+                
+                # Включение и запуск сервисов
+                systemctl enable --now libvirtd
+                systemctl enable --now virtlogd
+                
+                # Проверка установки
+                virt-host-validate && log "${GREEN}Проверка KVM прошла успешно${NC}"
+            fi
+            
+            # Добавление пользователя в группу
+            if ! groups $(whoami) | grep -q libvirt; then
+                usermod -aG libvirt $(whoami)
+                log "${YELLOW}Требуется перелогин для применения прав libvirt${NC}"
+            fi
+            ;;
+        *)
+            log "${RED}Неизвестный пакетный менеджер${NC}"
+            return 1
+            ;;
+    esac
+}
 
-    # Проверка KVM acceleration
-    if ! virt-host-validate qemu | grep -q "KVM acceleration"; then
-        log "${YELLOW}KVM acceleration недоступен, будет использован QEMU в режиме эмуляции${NC}"
-        local accelerator=""
-    else
-        local accelerator="--accelerate"
+    # 2. Подготовка ISO
+    if [[ "$vm_iso" =~ ^https?:// ]]; then
+        local iso_name=$(basename "$vm_iso")
+        local local_iso="$ISO_DIR/$iso_name"
+        
+        if [ ! -f "$local_iso" ]; then
+            log "${YELLOW}Скачивание ISO из $vm_iso...${NC}"
+            wget -P "$ISO_DIR" "$vm_iso" || {
+                log "${RED}Ошибка загрузки ISO${NC}"
+                return 1
+            }
+        fi
+        vm_iso="$local_iso"
     fi
 
-    # Проверка минимальной памяти
-    local min_mem=2048
-    if [ "$vm_ram" -lt "$min_mem" ]; then
-        log "${YELLOW}Увеличиваем память с $vm_ram до рекомендуемого минимума $min_mem MiB${NC}"
-        vm_ram=$min_mem
-    fi
-
-    # Создание диска
-    local disk_path=""
+    # 3. Создание диска
     case $vm_storage in
-        "lvm") disk_path="/dev/$LVM_VG/$vm_name" ;;
-        "zfs") disk_path="/dev/zvol/$ZFS_POOL/$vm_name" ;;
-        "ceph") disk_path="rbd:$CEPH_POOL_NAME/$vm_name" ;;
-        *) disk_path="$SHARED_STORAGE/$vm_name.qcow2" ;;
+        "lvm")
+            lvcreate -L "$vm_disk_size" -n "$vm_name" "$LVM_VG" || return 1
+            disk_path="/dev/$LVM_VG/$vm_name"
+            ;;
+        "zfs")
+            zfs create -V "$vm_disk_size" "$ZFS_POOL/$vm_name" || return 1
+            disk_path="/dev/zvol/$ZFS_POOL/$vm_name"
+            ;;
+        "ceph")
+            rbd create "$CEPH_POOL_NAME/$vm_name" --size "${vm_disk_size//[!0-9]/}G" || return 1
+            disk_path="rbd:$CEPH_POOL_NAME/$vm_name"
+            ;;
+        *)
+            qemu-img create -f qcow2 "$SHARED_STORAGE/$vm_name.qcow2" "$vm_disk_size" || return 1
+            disk_path="$SHARED_STORAGE/$vm_name.qcow2"
+            ;;
     esac
 
-    # Параметры графики
-    local graphics_params=""
-    if qemu-system-x86_64 --display help | grep -q "spice"; then
-        graphics_params="--graphics spice"
-    else
-        graphics_params="--graphics vnc"
-    fi
+    # 4. Создание ВМ с обработкой ошибок
+    local cmd=(
+        virt-install
+        --name "$vm_name"
+        --memory "$vm_ram"
+        --vcpus "$vm_cpus"
+        --disk "path=$disk_path,bus=virtio"
+        --network "network=$vm_network"
+        --graphics "vnc,listen=0.0.0.0"
+        --video "virtio"
+        --cdrom "$vm_iso"
+        --os-variant "detect=on"
+        --boot "cdrom,menu=on"
+        --noautoconsole
+        --wait -1
+    )
 
-    # Создание VM
-    virt-install \
-        --name "$vm_name" \
-        --memory "$vm_ram" \
-        --vcpus "$vm_cpus" \
-        --disk path="$disk_path",size="${vm_disk_size//[!0-9]/}",format=qcow2,bus=virtio \
-        --network network="$vm_network" \
-        $graphics_params \
-        --video model=cirrus \
-        --cdrom "$vm_iso" \
-        --os-variant "$VM_DEFAULT_OS_VARIANT" \
-        --boot cdrom \
-        --noautoconsole \
-        $accelerator
-
-    if [ $? -eq 0 ]; then
-        log "${GREEN}Виртуальная машина $vm_name успешно создана!${NC}"
+    log "${YELLOW}Запуск: ${cmd[@]}${NC}"
+    if "${cmd[@]}"; then
+        log "${GREEN}ВМ $vm_name успешно создана!${NC}"
+        return 0
     else
-        log "${RED}Ошибка при создании виртуальной машины${NC}"
-        log "${YELLOW}Пробуем альтернативную конфигурацию...${NC}"
-        
-        # Альтернативный вариант без spice
-        virt-install \
-            --name "$vm_name" \
-            --memory "$vm_ram" \
-            --vcpus "$vm_cpus" \
-            --disk path="$disk_path",size="${vm_disk_size//[!0-9]/}",format=qcow2,bus=virtio \
-            --network network="$vm_network" \
-            --graphics none \
-            --video model=cirrus \
-            --cdrom "$vm_iso" \
-            --os-variant "$VM_DEFAULT_OS_VARIANT" \
-            --boot cdrom \
-            --noautoconsole \
-            $accelerator
+        log "${RED}Ошибка при создании ВМ${NC}"
+        log "${YELLOW}Попробуйте вручную:${NC}"
+        echo "virt-install \\"
+        echo "  --name test \\"
+        echo "  --ram 2048 \\"
+        echo "  --vcpus 2 \\"
+        echo "  --disk size=20 \\"
+        echo "  --cdrom '$vm_iso'"
+        return 1
     fi
 }
 
