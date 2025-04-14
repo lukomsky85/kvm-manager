@@ -25,7 +25,7 @@ CEPH_POOL_NAME="libvirt-pool"
 LVM_VG="kvm-vg"
 ZFS_POOL="kvm-pool"
 VERSION_CHECK_URL="https://api.github.com/repos/libvirt/libvirt/tags"
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 API_PORT="8080"
 MONITORING_INTERVAL="60"
 OVIRT_ADMIN_PASSWORD=""
@@ -97,7 +97,6 @@ check_dependencies() {
     local common_pkgs=(
         "jq"
         "curl"
-        "libguestfs-tools"
     )
 
     case $pkg_manager in
@@ -111,16 +110,13 @@ check_dependencies() {
                 "virtinst"
                 "arp-scan"
                 "genisoimage"
+                "libguestfs-tools"
                 "${common_pkgs[@]}"
-                # LVM поддержка
                 "lvm2"
                 "thin-provisioning-tools"
-                # ZFS поддержка
                 "zfsutils-linux"
-                # Мониторинг
                 "sysstat"
                 "prometheus-node-exporter"
-                # Python
                 "python3"
                 "python3-pip"
                 "python3-venv"
@@ -133,8 +129,10 @@ check_dependencies() {
                 dnf update -y
                 dnf install -y dnf-plugins-core
                 dnf config-manager --enable powertools 2>/dev/null || true
+                dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm
             else
                 yum update -y
+                yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm
             fi
 
             required_pkgs=(
@@ -146,37 +144,91 @@ check_dependencies() {
                 "virt-install"
                 "arp-scan"
                 "genisoimage"
+                "libguestfs-tools"
                 "${common_pkgs[@]}"
-                # LVM поддержка
                 "lvm2"
                 "device-mapper-persistent-data"
-                # Мониторинг
                 "sysstat"
                 "python3"
                 "python3-pip"
             )
 
-            # Добавляем node_exporter вместо prometheus-node_exporter
-            if [[ "$ENABLE_MONITORING" == "true" ]]; then
-                required_pkgs+=("node_exporter")
+# Установка node_exporter
+if [[ "$ENABLE_MONITORING" == "true" ]]; then
+    if ! systemctl is-active --quiet node_exporter; then
+        log "${YELLOW}Настройка node_exporter...${NC}"
+        
+        # Скачивание и распаковка
+        local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz"
+        local temp_dir=$(mktemp -d)
+        curl -L $node_exporter_url | tar xz -C "$temp_dir"
+        
+        # Поиск бинарника в распакованной директории
+        local node_exporter_bin=$(find "$temp_dir" -name node_exporter -type f | head -n 1)
+        
+        if [[ -f "$node_exporter_bin" ]]; then
+            # Копирование бинарника
+            mkdir -p /usr/local/bin
+            cp "$node_exporter_bin" /usr/local/bin/node_exporter
+            chmod +x /usr/local/bin/node_exporter
+            
+            # Создание пользователя (если не существует)
+            if ! id -u node_exporter >/dev/null 2>&1; then
+                useradd -rs /bin/false node_exporter
             fi
+            
+            # Настройка systemd службы
+            cat > /etc/systemd/system/node_exporter.service <<EOF
+[Unit]
+Description=Node Exporter
+After=network.target
 
-            # Добавляем ZFS только если включено
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            
+            # Применение изменений
+            systemctl daemon-reload
+            systemctl enable --now node_exporter
+            
+            log "${GREEN}node_exporter успешно настроен${NC}"
+        else
+            log "${RED}Не удалось найти node_exporter в распакованных файлах${NC}"
+        fi
+        
+        # Очистка
+        rm -rf "$temp_dir"
+    else
+        log "${YELLOW}node_exporter уже запущен, пропускаем установку${NC}"
+    fi
+fi
+
+            # Установка ZFS только если включено
             if [[ "$ENABLE_ZFS" == "true" ]]; then
-                # Добавляем репозиторий ZFS для CentOS/RHEL с исправлением GPG-ключа
-                if ! rpm -q zfs-release &> /dev/null; then
+                if ! rpm -q zfs &> /dev/null; then
                     log "${YELLOW}Добавление репозитория ZFS...${NC}"
                     
-                    # Устанавливаем репозиторий без немедленного импорта ключа
+                    # Установка без проверки GPG-ключа
                     dnf install -y https://zfsonlinux.org/epel/zfs-release-2-3$(rpm --eval "%{dist}").noarch.rpm --nogpgcheck
                     
-                    # Альтернативный способ импорта ключа
+                    # Альтернативный способ получения ключа
                     rpm --import https://zfsonlinux.org/gpg.key 2>/dev/null || \
                     log "${YELLOW}Не удалось импортировать GPG-ключ ZFS, продолжаем без проверки подписи${NC}"
+                    
+                    # Установка ZFS
+                    dnf install -y zfs
+                    
+                    # Проверка загрузки модуля
+                    if ! lsmod | grep -q zfs; then
+                        log "${YELLOW}Модуль ZFS не загружен. Попробуйте перезагрузить систему.${NC}"
+                    fi
                 fi
-                required_pkgs+=("zfs")
-            else
-                log "${YELLOW}ZFS поддержка отключена${NC}"
             fi
             ;;
         *)
@@ -186,34 +238,10 @@ check_dependencies() {
     esac
 
     # Проверка и установка пакетов
-    local missing_pkgs=()
-    for pkg in "${required_pkgs[@]}"; do
-        if { [ "$pkg_manager" = "deb" ] && ! dpkg -l | grep -q "^ii  $pkg"; } ||
-           { [ "$pkg_manager" = "rpm" ] && ! rpm -q "$pkg" &> /dev/null; }; then
-            missing_pkgs+=("$pkg")
-        fi
-    done
-
-    if [ ${#missing_pkgs[@]} -ne 0 ]; then
-        log "${YELLOW}Установка недостающих пакетов: ${missing_pkgs[*]}${NC}"
-        install_packages "${missing_pkgs[@]}" || {
-            log "${RED}Не удалось установить некоторые пакеты${NC}"
-            
-            # Пропускаем проблемные пакеты
-            for pkg in "${missing_pkgs[@]}"; do
-                if ! { [ "$pkg_manager" = "deb" ] && dpkg -l | grep -q "^ii  $pkg"; } ||
-                   { [ "$pkg_manager" = "rpm" ] && rpm -q "$pkg" &> /dev/null; }; then
-                    log "${YELLOW}Пропуск проблемного пакета: $pkg${NC}"
-                fi
-            done
-        }
-    fi
-
-    # Проверка ZFS kernel module
-    if [[ "$ENABLE_ZFS" == "true" ]] && ! lsmod | grep -q zfs; then
-        log "${YELLOW}ZFS kernel module не загружен. Попытка загрузки...${NC}"
-        modprobe zfs || log "${RED}Не удалось загрузить ZFS модуль${NC}"
-    fi
+    log "${YELLOW}Установка основных пакетов...${NC}"
+    install_packages "${required_pkgs[@]}" || {
+        log "${YELLOW}Не удалось установить некоторые пакеты, продолжаем...${NC}"
+    }
 
     # Проверка бинарных файлов
     local missing_bins=()
@@ -225,13 +253,7 @@ check_dependencies() {
 
     if [ ${#missing_bins[@]} -ne 0 ]; then
         log "${RED}Отсутствуют необходимые компоненты: ${missing_bins[*]}${NC}"
-        log "Попробуйте переустановить пакеты вручную:"
-        if [ "$pkg_manager" = "deb" ]; then
-            log "sudo apt-get install --reinstall ${required_pkgs[*]}"
-        else
-            log "sudo yum reinstall ${required_pkgs[*]}"
-        fi
-        exit 1
+        return 1
     fi
 }
 
