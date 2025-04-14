@@ -552,86 +552,77 @@ create_vm() {
     local vm_iso=$5
     local vm_network=$6
     local vm_storage=$7
-    
+
     log "${YELLOW}Создание виртуальной машины $vm_name...${NC}"
-    
-    # Проверка существования VM
-    if virsh dominfo "$vm_name" &>/dev/null; then
-        log "${RED}Виртуальная машина с именем $vm_name уже существует${NC}"
-        return 1
+
+    # Проверка KVM acceleration
+    if ! virt-host-validate qemu | grep -q "KVM acceleration"; then
+        log "${YELLOW}KVM acceleration недоступен, будет использован QEMU в режиме эмуляции${NC}"
+        local accelerator=""
+    else
+        local accelerator="--accelerate"
     fi
-    
-    # Проверка и скачивание ISO если нужно
-    if [[ ! -f "$vm_iso" ]] && [[ "$vm_iso" =~ ^http ]]; then
-        log "${YELLOW}Скачивание ISO образа...${NC}"
-        wget -P "$ISO_DIR" "$vm_iso"
-        local iso_name=$(basename "$vm_iso")
-        vm_iso="$ISO_DIR/$iso_name"
+
+    # Проверка минимальной памяти
+    local min_mem=2048
+    if [ "$vm_ram" -lt "$min_mem" ]; then
+        log "${YELLOW}Увеличиваем память с $vm_ram до рекомендуемого минимума $min_mem MiB${NC}"
+        vm_ram=$min_mem
     fi
-    
+
     # Создание диска
     local disk_path=""
     case $vm_storage in
-        "lvm")
-            disk_path="/dev/$LVM_VG/$vm_name"
-            lvcreate -L "$vm_disk_size" -n "$vm_name" "$LVM_VG"
-            ;;
-        "zfs")
-            disk_path="/dev/zvol/$ZFS_POOL/$vm_name"
-            zfs create -V "$vm_disk_size" "$ZFS_POOL/$vm_name"
-            ;;
-        "ceph")
-            disk_path="rbd:$CEPH_POOL_NAME/$vm_name"
-            rbd create "$CEPH_POOL_NAME/$vm_name" --size "$(echo $vm_disk_size | tr -d 'G')G"
-            ;;
-        *)
-            disk_path="$SHARED_STORAGE/$vm_name.qcow2"
-            qemu-img create -f qcow2 "$disk_path" "$vm_disk_size"
-            ;;
+        "lvm") disk_path="/dev/$LVM_VG/$vm_name" ;;
+        "zfs") disk_path="/dev/zvol/$ZFS_POOL/$vm_name" ;;
+        "ceph") disk_path="rbd:$CEPH_POOL_NAME/$vm_name" ;;
+        *) disk_path="$SHARED_STORAGE/$vm_name.qcow2" ;;
     esac
-    
-    # Определяем доступные видео модели
-    local video_model="virtio"
-    if ! virsh domcapabilities | grep -q "<model type='virtio'/>"; then
-        video_model="cirrus"
-        log "${YELLOW}Модель virtio не доступна, используем cirrus${NC}"
+
+    # Параметры графики
+    local graphics_params=""
+    if qemu-system-x86_64 --display help | grep -q "spice"; then
+        graphics_params="--graphics spice"
+    else
+        graphics_params="--graphics vnc"
     fi
-    
-    # Создание VM с проверенной видео моделью
+
+    # Создание VM
     virt-install \
         --name "$vm_name" \
-        --ram "$vm_ram" \
+        --memory "$vm_ram" \
         --vcpus "$vm_cpus" \
-        --disk path="$disk_path",bus=virtio \
+        --disk path="$disk_path",size="${vm_disk_size//[!0-9]/}",format=qcow2,bus=virtio \
         --network network="$vm_network" \
-        --graphics spice \
-        --video model="$video_model" \
+        $graphics_params \
+        --video model=cirrus \
         --cdrom "$vm_iso" \
-        --os-type "$VM_DEFAULT_OS_TYPE" \
         --os-variant "$VM_DEFAULT_OS_VARIANT" \
         --boot cdrom \
-        --noautoconsole
-    
-    if [ $? -ne 0 ]; then
+        --noautoconsole \
+        $accelerator
+
+    if [ $? -eq 0 ]; then
+        log "${GREEN}Виртуальная машина $vm_name успешно создана!${NC}"
+    else
         log "${RED}Ошибка при создании виртуальной машины${NC}"
-        log "${YELLOW}Пробуем альтернативную конфигурацию без spice...${NC}"
+        log "${YELLOW}Пробуем альтернативную конфигурацию...${NC}"
         
+        # Альтернативный вариант без spice
         virt-install \
             --name "$vm_name" \
-            --ram "$vm_ram" \
+            --memory "$vm_ram" \
             --vcpus "$vm_cpus" \
-            --disk path="$disk_path",bus=virtio \
+            --disk path="$disk_path",size="${vm_disk_size//[!0-9]/}",format=qcow2,bus=virtio \
             --network network="$vm_network" \
-            --graphics vnc \
-            --video model="$video_model" \
+            --graphics none \
+            --video model=cirrus \
             --cdrom "$vm_iso" \
-            --os-type "$VM_DEFAULT_OS_TYPE" \
             --os-variant "$VM_DEFAULT_OS_VARIANT" \
             --boot cdrom \
-            --noautoconsole
+            --noautoconsole \
+            $accelerator
     fi
-    
-    log "${GREEN}Виртуальная машина $vm_name успешно создана!${NC}"
 }
 
 # Создание VM через UI
