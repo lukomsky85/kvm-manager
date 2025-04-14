@@ -1043,67 +1043,90 @@ install_ovirt() {
     
     case $pkg_manager in
         "rpm")
-            # Проверяем, не установлен ли уже oVirt
+            # Проверка уже установленного oVirt
             if rpm -q ovirt-engine &>/dev/null; then
                 log "${YELLOW}oVirt Engine уже установлен${NC}"
                 return 0
             fi
 
-            # Упрощённая установка для CentOS/RHEL 8+
-            if grep -q "CentOS Linux 8" /etc/centos-release || grep -q "Red Hat Enterprise Linux 8" /etc/redhat-release; then
-                log "${GREEN}Обнаружена CentOS/RHEL 8+, используем упрощённую установку${NC}"
-                
-                # Устанавливаем необходимые репозитории
-                dnf install -y centos-release-ovirt45
-                dnf install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
-                
-                # Отключаем модуль postgresql для правильной установки
-                dnf module -y disable postgresql
-                
-                # Устанавливаем оVirt Engine с автоматической настройкой
-                dnf install -y ovirt-engine
-                
-                # Генерируем случайный пароль, если не задан
-                if [ -z "$OVIRT_ADMIN_PASSWORD" ]; then
-                    OVIRT_ADMIN_PASSWORD=$(openssl rand -base64 12)
-                    log "${YELLOW}Сгенерирован случайный пароль admin: $OVIRT_ADMIN_PASSWORD${NC}"
-                fi
-                
-                # Автоматическая настройка с минимальными параметрами
-                engine-setup --accept-defaults \
-                    --admin-password="$OVIRT_ADMIN_PASSWORD" \
-                    --config-append=/etc/ovirt-engine-setup.conf.d/10-setup-answers.conf
-                
-                # Сохраняем пароль в файл
-                echo "Admin password: $OVIRT_ADMIN_PASSWORD" > /etc/ovirt-engine/credentials.txt
-                chmod 600 /etc/ovirt-engine/credentials.txt
-                
-                # Включаем и запускаем сервисы
-                systemctl enable --now ovirt-engine
-                systemctl enable --now httpd
-                
-                log "${GREEN}oVirt Engine успешно установлен!${NC}"
-                log "Доступ через веб-интерфейс: https://$(hostname -f)/ovirt-engine"
-                log "Логин: admin"
-                log "Пароль: $OVIRT_ADMIN_PASSWORD (также сохранен в /etc/ovirt-engine/credentials.txt)"
-                return 0
+            # Определение версии ОС
+            local os_version=""
+            local os_id=""
+            
+            if [ -f /etc/os-release ]; then
+                os_id=$(grep -oP 'ID="?\K\w+' /etc/os-release)
+                os_version=$(grep -oP 'VERSION_ID="?\K[\w.]+' /etc/os-release)
             fi
 
-            # Стандартная установка для других версий
-            if [ ! -f /etc/yum.repos.d/ovirt.repo ]; then
-                dnf install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
-                dnf install -y ovirt-engine
-                
-                log "${YELLOW}Запуск интерактивной настройки oVirt Engine...${NC}"
-                log "Для автоматической установки примите значения по умолчанию (нажимайте Enter)"
-                engine-setup
-            else
-                log "${YELLOW}oVirt Engine уже установлен${NC}"
+            # Проверка поддержки ОС
+            if [[ "$os_id" != "rhel" && "$os_id" != "centos" ]]; then
+                log "${RED}oVirt Engine поддерживается только на RHEL/CentOS${NC}"
+                return 1
             fi
+
+            if [[ "$os_version" < "8" ]]; then
+                log "${RED}Требуется RHEL/CentOS 8 или новее${NC}"
+                return 1
+            fi
+
+            log "${YELLOW}Установка для ${os_id^^} $os_version${NC}"
+
+            # Установка необходимых репозиториев
+            log "${YELLOW}Добавление репозиториев oVirt...${NC}"
+            dnf install -y https://resources.ovirt.org/pub/yum-repo/ovirt-release44.rpm
+            
+            # Включение дополнительных репозиториев
+            log "${YELLOW}Включение дополнительных репозиториев...${NC}"
+            dnf config-manager --enable powertools >/dev/null 2>&1 || \
+            dnf config-manager --enable crb >/dev/null 2>&1 || \
+            log "${YELLOW}Не удалось включить powertools/crb, продолжаем...${NC}"
+
+            # Обновление кэша
+            log "${YELLOW}Обновление кэша пакетов...${NC}"
+            dnf clean all
+            dnf makecache
+
+            # Установка ovirt-engine
+            log "${YELLOW}Установка пакетов oVirt Engine...${NC}"
+            if ! dnf install -y ovirt-engine; then
+                log "${RED}Не удалось установить ovirt-engine из репозиториев${NC}"
+                log "${YELLOW}Попробуйте альтернативный источник...${NC}"
+                dnf install -y centos-release-ovirt45
+                dnf install -y ovirt-engine || {
+                    log "${RED}Ошибка установки oVirt Engine${NC}"
+                    return 1
+                }
+            fi
+
+            # Генерация пароля администратора
+            if [ -z "$OVIRT_ADMIN_PASSWORD" ]; then
+                OVIRT_ADMIN_PASSWORD=$(openssl rand -base64 12)
+                log "${YELLOW}Сгенерирован пароль admin: $OVIRT_ADMIN_PASSWORD${NC}"
+            fi
+
+            # Автоматическая настройка
+            log "${YELLOW}Настройка oVirt Engine...${NC}"
+            engine-setup --accept-defaults \
+                --admin-password="$OVIRT_ADMIN_PASSWORD" \
+                --config-append=/etc/ovirt-engine-setup.conf.d/10-setup-answers.conf
+
+            # Сохранение учетных данных
+            echo "oVirt Engine Credentials:" > /etc/ovirt-engine/credentials.txt
+            echo "URL: https://$(hostname -f)/ovirt-engine" >> /etc/ovirt-engine/credentials.txt
+            echo "Username: admin" >> /etc/ovirt-engine/credentials.txt
+            echo "Password: $OVIRT_ADMIN_PASSWORD" >> /etc/ovirt-engine/credentials.txt
+            chmod 600 /etc/ovirt-engine/credentials.txt
+
+            # Запуск сервисов
+            systemctl enable --now ovirt-engine
+            systemctl enable --now httpd
+
+            log "${GREEN}oVirt Engine успешно установлен!${NC}"
+            log "Доступ через: https://$(hostname -f)/ovirt-engine"
+            log "Учетные данные сохранены в: /etc/ovirt-engine/credentials.txt"
             ;;
         "deb")
             log "${RED}oVirt Engine не поддерживается на DEB-системах${NC}"
-            log "Используйте CentOS/RHEL 8+ для установки oVirt"
             return 1
             ;;
         *)
@@ -1111,11 +1134,6 @@ install_ovirt() {
             return 1
             ;;
     esac
-    
-    log "${GREEN}oVirt Engine установлен. Доступен через web-интерфейс: https://$(hostname -I | awk '{print $1}'):443${NC}"
-    log "Для доступа используйте:"
-    log "Логин: admin"
-    log "Пароль: указанный при установке (хранится в /etc/ovirt-engine/credentials.txt)"
 }
 
 # Установка Proxmox VE
